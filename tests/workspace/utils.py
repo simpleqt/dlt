@@ -1,7 +1,9 @@
 from contextlib import contextmanager, nullcontext
 import os
 import shutil
-from typing import Generator, Iterator
+import sys
+from typing import Any, Generator, Iterator, List, Tuple
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -11,6 +13,7 @@ from dlt.common.configuration.specs.pluggable_run_context import RunContextBase,
 from dlt.common.runtime.run_context import switch_context
 from dlt.common.storages.file_storage import FileStorage
 from dlt.common.utils import set_working_dir
+from dlt.pipeline import platform
 
 from dlt._workspace._workspace_context import WorkspaceRunContext
 
@@ -52,6 +55,25 @@ def isolated_workspace(
         yield ctx  # type: ignore
 
 
+@contextmanager
+def importable_workspace(name: str, *modules: str) -> Iterator[WorkspaceRunContext]:
+    """`isolated_workspace` with its root on `sys.path`, as `python -m` gives a launcher.
+
+    Args:
+        name (str): Workspace under `WORKSPACE_CASES_DIR`.
+        modules (str): Workspace modules to drop from `sys.modules` on exit, so the next
+            copy of the workspace is imported afresh.
+    """
+    with isolated_workspace(name) as ctx:
+        sys.path.insert(0, ctx.run_dir)
+        try:
+            yield ctx
+        finally:
+            sys.path.remove(ctx.run_dir)
+            for module in modules:
+                sys.modules.pop(module, None)
+
+
 def restore_clean_workspace(name: str) -> str:
     """Create a fresh copy of a workspace for a test run.
 
@@ -88,6 +110,34 @@ def restore_clean_workspace(name: str) -> str:
         shutil.copytree(source_workspace_dir, new_run_dir, dirs_exist_ok=True)
 
     return new_run_dir
+
+
+def drain_beacon() -> None:
+    """Waits for the fire-and-forget beacon pool, so a test sees everything a run sent."""
+    assert platform._THREAD_POOL is not None
+    platform._THREAD_POOL.thread_pool.shutdown(wait=True)
+
+
+@pytest.fixture
+def beacon() -> Iterator[List[Tuple[str, str]]]:
+    """Beacon PUTs the test's runs send, as `(url, body)`, on a tracker reset around the test."""
+    sent: List[Tuple[str, str]] = []
+
+    def _put(url: str, data: str) -> Any:
+        sent.append((url, data))
+        return MagicMock(status_code=200)
+
+    platform._THREAD_POOL = None
+    platform.init_platform_tracker()
+    patcher = patch.object(platform, "requests")
+    patcher.start().put.side_effect = _put
+    try:
+        yield sent
+    finally:
+        # drained while still patched, so a late PUT lands here and not on the network
+        drain_beacon()
+        patcher.stop()
+        platform._THREAD_POOL = None
 
 
 @pytest.fixture
